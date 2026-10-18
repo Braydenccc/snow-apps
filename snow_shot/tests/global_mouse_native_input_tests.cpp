@@ -3,6 +3,7 @@
 #include <QAbstractEventDispatcher>
 #include <QSemaphore>
 #include <QTimer>
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -27,6 +28,7 @@ struct NativeInput {
     std::vector<GlobalMouseDragEvent> events;
     std::function<void()> scenario;
     bool injectionBlocked = false;
+    UINT sendLimit = 0;
     bool mouseInstallBlocked = false;
     int mouseInstalls = 0;
     int mouseRemovals = 0;
@@ -93,14 +95,16 @@ struct NativeInput {
         if (instance->injectionBlocked) {
             return 0;
         }
-        for (UINT index = 0; index < count; ++index) {
+        const UINT accepted =
+            instance->sendLimit == 0 ? count : std::min(count, instance->sendLimit);
+        for (UINT index = 0; index < accepted; ++index) {
             const INPUT input = inputs[index];
             instance->sent.push_back(input);
             require(instance->key(input.ki.wVk, (input.ki.dwFlags & KEYEVENTF_KEYUP) != 0,
                                   LLKHF_INJECTED) == 0,
                     "injected input must pass through without recursive masking");
         }
-        return count;
+        return accepted;
     }
 
     LRESULT key(DWORD code, bool up, DWORD flags = 0) {
@@ -182,20 +186,23 @@ void globalMouseNativeActivationKeyTests() {
                         require(input.key(key, true) == 1,
                                 "used Windows and Alt releases must not reach the OS unmasked");
                         require(input.sent.size() == sentBefore + 3,
-                                "release must inject a mask pair and a balanced modifier key-up");
-                        const auto& release = input.sent.back();
-                        require(input.sent[sentBefore].ki.wVk == 0xE8 &&
-                                    input.sent[sentBefore].ki.dwFlags == 0 &&
-                                    input.sent[sentBefore + 1].ki.wVk == 0xE8 &&
-                                    input.sent[sentBefore + 1].ki.dwFlags == KEYEVENTF_KEYUP,
-                                "the mask key must precede the balanced modifier release");
-                        require(
-                            release.ki.wVk == key && release.ki.wScan == 42 &&
-                                (release.ki.dwFlags & KEYEVENTF_KEYUP) != 0 && !input.down[key],
-                            "the forwarded press must be balanced without leaving the key stuck");
+                                "release must inject a mask-down, the modifier release, and a "
+                                "mask-up");
+                        const auto& maskDown = input.sent[sentBefore];
+                        const auto& release = input.sent[sentBefore + 1];
+                        const auto& maskUp = input.sent[sentBefore + 2];
+                        require(maskDown.ki.wVk == 0xE8 && maskDown.ki.dwFlags == 0 &&
+                                    maskUp.ki.wVk == 0xE8 && maskUp.ki.dwFlags == KEYEVENTF_KEYUP,
+                                "the mask key must stay pressed across the modifier release");
+                        require(release.ki.wVk == key && release.ki.wScan == 42 &&
+                                    (release.ki.dwFlags & KEYEVENTF_KEYUP) != 0 && !input.down[key],
+                                "the forwarded press must be balanced without leaving the key "
+                                "stuck");
                         require(((release.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0) ==
                                     (key != VK_LMENU),
                                 "replacement releases must preserve extended key identity");
+                        require(!input.down[0xE8],
+                                "the mask key must be lifted after the modifier release");
                         require(input.key(key, false) == 0 && input.key(key, true) == 0,
                                 "a later standalone activation key must work normally");
                     }
@@ -240,6 +247,29 @@ void globalMouseNativeActivationKeyTests() {
                 "unclaimed keys and failed release injection must forward the physical release");
             require(input.key(VK_LWIN, false) == 0 && input.key(VK_LWIN, true) == 0,
                     "failed injection must not leave stale ownership");
+        };
+        input.run();
+    }
+
+    for (const UINT accepted : {1u, 2u}) {
+        NativeInput input;
+        input.configuration.bindings[0].modifiers = GlobalMouseModifier::Super;
+        input.scenario = [&] {
+            require(input.key(VK_LWIN, false) == 0 && input.button(false) == 1,
+                    "the configured gesture must activate before partial injection");
+            const auto sentBefore = input.sent.size();
+            input.sendLimit = accepted;
+            const LRESULT consumed = input.key(VK_LWIN, true);
+            input.sendLimit = 0;
+            require(consumed == (accepted == 2 ? 1 : 0),
+                    "only a delivered replacement release may suppress the physical release");
+            require(input.sent.size() == sentBefore + accepted + 1,
+                    "a partially delivered batch must be cleaned up with a mask key release");
+            const auto& cleanup = input.sent.back();
+            require(cleanup.ki.wVk == 0xE8 && cleanup.ki.dwFlags == KEYEVENTF_KEYUP,
+                    "the cleanup must lift the mask key");
+            require(!input.down[VK_LWIN] && !input.down[0xE8],
+                    "partial injection must not leave either key stuck");
         };
         input.run();
     }

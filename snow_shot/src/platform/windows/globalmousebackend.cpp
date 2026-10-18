@@ -240,23 +240,43 @@ class NativeGlobalMouseBackend final : public GlobalMouseBackend {
 
     bool maskActivationKey(const KBDLLHOOKSTRUCT* release = nullptr) {
         // VK 0xE8 is an unassigned menu-mask key, with no application command.
+        // Windows treats the modifier release as a standalone tap unless the
+        // mask is still down while that release is processed; lifting the mask
+        // first can therefore still open the Start menu or the window menu bar.
         INPUT inputs[3]{};
         inputs[0].type = INPUT_KEYBOARD;
         inputs[0].ki.wVk = 0xE8;
-        inputs[1] = inputs[0];
-        inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
         UINT count = 2;
         if (release != nullptr) {
-            inputs[2].type = INPUT_KEYBOARD;
-            inputs[2].ki.wVk = static_cast<WORD>(release->vkCode);
-            inputs[2].ki.wScan = static_cast<WORD>(release->scanCode);
-            inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            inputs[1].type = INPUT_KEYBOARD;
+            inputs[1].ki.wVk = static_cast<WORD>(release->vkCode);
+            inputs[1].ki.wScan = static_cast<WORD>(release->scanCode);
+            inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
             if ((release->flags & LLKHF_EXTENDED) != 0) {
-                inputs[2].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+                inputs[1].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
             }
+            inputs[2] = inputs[0];
+            inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
             count = 3;
+        } else {
+            inputs[1] = inputs[0];
+            inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
         }
-        return api.sendInput(count, inputs, sizeof(INPUT)) == count;
+        const UINT sent = api.sendInput(count, inputs, sizeof(INPUT));
+        if (sent == count) {
+            return true;
+        }
+        if (sent != 0) {
+            // A partially delivered batch must not leave the mask key logically down.
+            INPUT cleanup{};
+            cleanup.type = INPUT_KEYBOARD;
+            cleanup.ki.wVk = 0xE8;
+            cleanup.ki.dwFlags = KEYEVENTF_KEYUP;
+            static_cast<void>(api.sendInput(1, &cleanup, sizeof(INPUT)));
+        }
+        // Once the replacement modifier release is in the stream, the physical
+        // release must be swallowed to avoid delivering the up event twice.
+        return release != nullptr && sent >= 2;
     }
 
     bool handle(const GlobalMouseInput& input) {
@@ -269,6 +289,8 @@ class NativeGlobalMouseBackend final : public GlobalMouseBackend {
                     consumedActivationKeys[index] = true;
                 }
             }
+            // Mark the chord while the modifier is still down. The release path
+            // then keeps the mask pressed across the forwarded modifier release.
             static_cast<void>(maskActivationKey());
         }
         if (result.event && onEvent) {
